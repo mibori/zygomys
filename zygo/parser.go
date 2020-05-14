@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var NaN float64
@@ -22,6 +24,7 @@ type Parser struct {
 
 	Done         chan bool
 	reqStop      chan bool
+	timeout      chan bool
 	AddInput     chan io.RuneScanner
 	ReqReset     chan io.RuneScanner
 	ParsedOutput chan []ParserReply
@@ -32,6 +35,9 @@ type Parser struct {
 	FlagSendNeedInput bool
 
 	inBacktick bool
+	recur      int64
+
+	EagerlyRetireParserGoro bool
 }
 
 type ParserReply struct {
@@ -44,6 +50,7 @@ func (env *Zlisp) NewParser() *Parser {
 		env:          env,
 		Done:         make(chan bool),
 		reqStop:      make(chan bool),
+		timeout:      make(chan bool, 10),
 		ReqReset:     make(chan io.RuneScanner),
 		AddInput:     make(chan io.RuneScanner),
 		ParsedOutput: make(chan []ParserReply),
@@ -54,15 +61,19 @@ func (env *Zlisp) NewParser() *Parser {
 }
 
 func (p *Parser) Stop() error {
+	p.stopNoWait()
+	<-p.Done
+	return nil
+}
+
+func (p *Parser) stopNoWait() {
 	p.mut.Lock()
 	defer p.mut.Unlock()
 	if p.stopped {
-		return nil
+		return
 	}
 	p.stopped = true
 	close(p.reqStop)
-	<-p.Done
-	return nil
 }
 
 // Starts launches a background goroutine that runs an
@@ -79,11 +90,11 @@ func (p *Parser) Start() {
 		for {
 			expr, err := p.ParseExpression(0)
 			if err != nil || expr == SexpEnd {
-				if err == ParserHaltRequested {
+				if err == ParserHaltRequested || err == ErrParserTimeout {
 					return
 				}
 				err = p.GetMoreInput(expressions, err)
-				if err == ParserHaltRequested {
+				if err == ParserHaltRequested || err == ErrParserTimeout {
 					return
 				}
 				// GetMoreInput will have delivered what we gave them. Reset since we
@@ -121,7 +132,13 @@ func (p *Parser) GetMoreInput(deliverThese []Sexp, errorToReport error) error {
 			})
 	}
 
+	var chTimeout <-chan time.Time
 	for {
+		if p.EagerlyRetireParserGoro {
+			chTimeout = time.After(2 * time.Second)
+		} else {
+			chTimeout = nil
+		}
 		select {
 		case <-p.reqStop:
 			return ParserHaltRequested
@@ -137,6 +154,13 @@ func (p *Parser) GetMoreInput(deliverThese []Sexp, errorToReport error) error {
 		case p.HaveStuffToSend() <- p.sendMe:
 			p.sendMe = make([]ParserReply, 0, 1)
 			p.FlagSendNeedInput = false
+		case <-chTimeout:
+			recur := atomic.LoadInt64(&p.recur)
+			if recur == 0 {
+				//fmt.Printf("timing out\n")
+				close(p.timeout)
+				return ErrParserTimeout
+			}
 		}
 	}
 }
@@ -166,6 +190,7 @@ func (p *Parser) ResetAddNewInput(s io.RuneScanner) {
 	select {
 	case p.ReqReset <- s:
 	case <-p.reqStop:
+	case <-p.timeout:
 	}
 }
 
@@ -174,6 +199,9 @@ var UnexpectedEnd error = errors.New("Unexpected end of input")
 const SliceDefaultCap = 10
 
 func (parser *Parser) ParseList(depth int) (sx Sexp, err error) {
+	atomic.AddInt64(&parser.recur, 1)
+	defer atomic.AddInt64(&parser.recur, -1)
+
 	lexer := parser.lexer
 	var tok Token
 
@@ -191,7 +219,7 @@ tokFilled:
 		err = parser.GetMoreInput(nil, ErrMoreInputNeeded)
 		//Q("\n ParseList(depth=%d) got back from parser.GetMoreInput(): '%v'\n", depth, err)
 		switch err {
-		case ParserHaltRequested:
+		case ParserHaltRequested, ErrParserTimeout:
 			return SexpNull, err
 		case ResetRequested:
 			return SexpEnd, err
@@ -251,6 +279,9 @@ tokFilled:
 }
 
 func (parser *Parser) ParseArray(depth int) (Sexp, error) {
+	atomic.AddInt64(&parser.recur, 1)
+	defer atomic.AddInt64(&parser.recur, -1)
+
 	lexer := parser.lexer
 	arr := make([]Sexp, 0, SliceDefaultCap)
 
@@ -277,7 +308,7 @@ func (parser *Parser) ParseArray(depth int) (Sexp, error) {
 				// we ask for more, and then loop
 				err = parser.GetMoreInput(nil, ErrMoreInputNeeded)
 				switch err {
-				case ParserHaltRequested:
+				case ParserHaltRequested, ErrParserTimeout:
 					return SexpNull, err
 				case ResetRequested:
 					return SexpEnd, err
@@ -302,6 +333,9 @@ func (parser *Parser) ParseArray(depth int) (Sexp, error) {
 }
 
 func (parser *Parser) ParseExpression(depth int) (res Sexp, err error) {
+	atomic.AddInt64(&parser.recur, 1)
+	defer atomic.AddInt64(&parser.recur, -1)
+
 	defer func() {
 		if res != nil {
 			//Q("returning from ParseExpression at depth=%v with res='%s'\n", depth, res.SexpString(nil))
@@ -487,10 +521,13 @@ func (p *Parser) ParseTokens() ([]Sexp, error) {
 		return r, nil
 	case <-p.reqStop:
 		return nil, ErrShuttingDown
+	case <-p.timeout:
+		return nil, ErrParserTimeout
 	}
 }
 
 var ErrShuttingDown error = fmt.Errorf("lexer shutting down")
+var ErrParserTimeout error = fmt.Errorf("parser timeout")
 
 func (parser *Parser) ParseBlockComment(start *Token) (sx Sexp, err error) {
 	defer func() {
@@ -515,7 +552,7 @@ func (parser *Parser) ParseBlockComment(start *Token) (sx Sexp, err error) {
 			}
 			err = parser.GetMoreInput(nil, ErrMoreInputNeeded)
 			switch err {
-			case ParserHaltRequested:
+			case ParserHaltRequested, ErrParserTimeout:
 				return SexpNull, err
 			case ResetRequested:
 				return SexpEnd, err
@@ -562,7 +599,7 @@ func (parser *Parser) ParseBacktickString(start *Token) (sx Sexp, err error) {
 			}
 			err = parser.GetMoreInput(nil, ErrMoreInputNeeded)
 			switch err {
-			case ParserHaltRequested:
+			case ParserHaltRequested, ErrParserTimeout:
 				return SexpNull, err
 			case ResetRequested:
 				return SexpEnd, err
@@ -587,6 +624,9 @@ func (parser *Parser) ParseBacktickString(start *Token) (sx Sexp, err error) {
 }
 
 func (parser *Parser) ParseInfix(depth int) (Sexp, error) {
+	atomic.AddInt64(&parser.recur, 1)
+	defer atomic.AddInt64(&parser.recur, -1)
+
 	lexer := parser.lexer
 	arr := make([]Sexp, 0, SliceDefaultCap)
 	var err error
@@ -606,7 +646,7 @@ func (parser *Parser) ParseInfix(depth int) (Sexp, error) {
 				// we ask for more, and then loop
 				err = parser.GetMoreInput(nil, ErrMoreInputNeeded)
 				switch err {
-				case ParserHaltRequested:
+				case ParserHaltRequested, ErrParserTimeout:
 					return SexpNull, err
 				case ResetRequested:
 					return SexpEnd, err
